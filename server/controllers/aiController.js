@@ -3,9 +3,6 @@ import sql from "../configs/db.js";
 import { clerkClient } from "@clerk/express";
 import { v2 as cloudinary } from 'cloudinary';
 import axios from "axios";
-import { createRequire } from "module";
-const require = createRequire(import.meta.url);
-const { PDFParse } = require("pdf-parse");
 
 const AI = new OpenAI({
     apiKey: process.env.GEMINI_API_KEY,
@@ -49,6 +46,39 @@ const getErrorDetails = async (error) => {
     if (error?.code) details.code = error.code;
 
     return details;
+};
+
+const callAIWithRetry = async (messages, model, maxRetries = 3, maxTokens = 3600) => {
+    let lastError;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+        try {
+            const response = await AI.chat.completions.create({
+                model,
+                messages,
+                temperature: 0.7,
+                max_tokens: maxTokens,
+            });
+            return response;
+        } catch (error) {
+            lastError = error;
+            const status = error?.status || error?.response?.status;
+            
+            // Only retry on 503 (Service Unavailable) or 429 (Rate Limit)
+            if (status !== 503 && status !== 429) {
+                throw error;
+            }
+            
+            // Exponential backoff: 2s, 4s, 8s
+            if (attempt < maxRetries - 1) {
+                const delayMs = Math.pow(2, attempt + 1) * 1000;
+                console.log(`AI API unavailable (${status}). Retrying in ${delayMs}ms... (Attempt ${attempt + 1}/${maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+            }
+        }
+    }
+    
+    throw lastError;
 };
 
 const saveCreation = async ({ userId, prompt, content, type, publish = false }) => {
@@ -167,17 +197,12 @@ export const generateArticle = async (req, res) => {
             return res.status(400).json({ success: false, message: "Prompt is required." });
         }
 
-        const response = await AI.chat.completions.create({
-            model: AI_MODEL,
-            messages: [
-                {
-                    role: "user",
-                    content: prompt.trim(),
-                },
-            ],
-            temperature: 0.7,
-            max_tokens: Math.ceil(Number(length) * 3) ,
-        });
+        const response = await callAIWithRetry([
+            {
+                role: "user",
+                content: prompt.trim(),
+            },
+        ], AI_MODEL, 3, Math.ceil(Number(length) * 3));
 
         const content = response.choices?.[0]?.message?.content;
 
@@ -246,21 +271,16 @@ export const generateBlogTitle = async (req, res) => {
             `- No markdown, no code fences, no explanation text.\n` +
             `- Each title must be complete and no longer than 14 words.`;
 
-        const response = await AI.chat.completions.create({
-            model: AI_MODEL,
-            messages: [
-                {
-                    role: 'system',
-                    content: 'You write concise, complete blog titles and follow formatting instructions exactly.',
-                },
-                {
-                    role: 'user',
-                    content: finalPrompt,
-                },
-            ],
-            temperature: 0.7,
-            max_tokens: 500,
-        });
+        const response = await callAIWithRetry([
+            {
+                role: 'system',
+                content: 'You write concise, complete blog titles and follow formatting instructions exactly.',
+            },
+            {
+                role: 'user',
+                content: finalPrompt,
+            },
+        ], AI_MODEL, 3, 500);
 
         console.log('generateBlogTitle prompt:', finalPrompt);
         console.log('generateBlogTitle raw response:', JSON.stringify(response?.choices?.[0]?.message?.content));
@@ -486,6 +506,7 @@ export const resumeReview = async (req, res) => {
             return res.json({ success: false, message: "File size should be less than 5MB." })
         }
 
+        const { PDFParse } = await import("pdf-parse");
         const parser = new PDFParse({ data: resume.buffer });
         const pdfData = await parser.getText();
         await parser.destroy();
@@ -519,24 +540,18 @@ Resume Content:
 
 ${pdfData.text}`;
 
-        const response = await AI.chat.completions.create({
-            model: AI_MODEL,
-            messages: [
-                {
-                    role: "user",
-                    content: prompt,
-                },
-            ],
-            temperature: 0.7,
-            max_tokens: 3600,
-        });
+        const response = await callAIWithRetry([
+            {
+                role: "user",
+                content: prompt,
+            },
+        ], AI_MODEL);
 
         let content = response.choices[0].message.content || "";
 
         if (content.trim().split(/\s+/).length < 1500) {
-            const expandResponse = await AI.chat.completions.create({
-                model: AI_MODEL,
-                messages: [
+            try {
+                const expandResponse = await callAIWithRetry([
                     {
                         role: "user",
                         content: `${prompt}
@@ -553,12 +568,13 @@ Expand and improve this draft significantly.
 - Do not shorten existing useful content.
 - Return the full improved review in markdown.`,
                     },
-                ],
-                temperature: 0.7,
-                max_tokens: 3600,
-            });
+                ], AI_MODEL);
 
-            content = expandResponse.choices[0].message.content || content;
+                content = expandResponse.choices[0].message.content || content;
+            } catch (expandError) {
+                console.log("Resume expansion failed, using initial content:", expandError?.message);
+                // Use the initial content if expansion fails
+            }
         }
 
         await saveCreation({

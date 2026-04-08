@@ -9,7 +9,7 @@ import toast from 'react-hot-toast'
 axios.defaults.baseURL = import.meta.env.VITE_BASE_URL || 'http://localhost:3000';
 
 
-const DashBoard = () => {
+const Dashboard = () => {
 
   const [creations, setcreations] = useState([])
   const [loading, setLoading] = useState(true)
@@ -87,4 +87,4 @@ const DashBoard = () => {
   )
 }
 
-export default DashBoard
+export default Dashboard
